@@ -84,7 +84,7 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y \
 # 10. Install SonarScanner CLI
 RUN wget -O /tmp/sonar.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189-linux-x64.zip" \
     && unzip /tmp/sonar.zip -d /opt \
-    && mv /opt/sonar-scanner-*-linux /opt/sonar-scanner \
+    && mv /opt/sonar-scanner-* /opt/sonar-scanner \
     && ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/bin/sonar-scanner \
     && rm /tmp/sonar.zip
 
