@@ -204,18 +204,16 @@ credentials:
 
 # --- Plugin Configuration (The "Bridge" to GitLab) ---
 unclassified:
-  # The correct JCasC symbol is 'gitLabConnectionConfig'
-  gitLabConnectionConfig:
-    connections:
+  # The correct JCasC root for 'gitlab-branch-source' is 'gitLabServers'
+  gitLabServers:
+    servers:
       - name: "Local GitLab"
-        # This is the correct attribute for the URL
-        url: "https://gitlab:10300"
-        # This is the correct attribute for the credential ID
-        apiTokenId: "gitlab-api-token"
-        # This is the fix for the 'client-builder-id' error
-        clientBuilderId: "autodetect"
-        connectionTimeout: 10
-        readTimeout: 10
+        serverUrl: "https://gitlab:10300"
+        credentialsId: "gitlab-api-token"
+        # We don't need 'clientBuilderId' for this plugin,
+        # but we do need to enable hook management.
+        manageWebHooks: true
+        manageSystemHooks: false
 EOF
 echo "   Done."
 
