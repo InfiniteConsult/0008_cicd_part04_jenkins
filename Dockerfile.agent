@@ -12,7 +12,7 @@
 # -----------------------------------------------------------
 
 # 1. Start from the official Jenkins agent image (Debian 12 + JDK 17)
-FROM jenkins/agent:latest-jdk17
+FROM jenkins/agent:latest-jdk21
 LABEL authors="warren_jitsing"
 
 # 2. Get ARGs from our dev-container for custom builds

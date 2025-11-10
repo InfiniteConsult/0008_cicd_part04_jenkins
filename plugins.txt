@@ -9,6 +9,27 @@
 # "Foreman," giving it new capabilities.
 # -----------------------------------------------------------
 
+# --- Dependencies and standard plugins ---
+pipeline-model-definition:latest
+cloudbees-folder:latest
+antisamy-markup-formatter:latest
+build-timeout:latest
+credentials-binding:latest
+timestamper:latest
+ws-cleanup:latest
+ant:latest
+gradle:latest
+workflow-aggregator:latest
+github-branch-source:latest
+pipeline-github-lib:latest
+pipeline-graph-analysis:latest
+git:latest
+ssh-slaves:latest
+ldap:latest
+email-ext:latest
+mailer:latest
+dark-theme:latest
+
 # --- Core Setup & Configuration ---
 
 # The "Blueprint Reader": Allows us to configure Jenkins using
@@ -18,7 +39,6 @@ configuration-as-code:latest
 # The "Security Guard": Allows us to create the granular
 # "who-can-do-what" permissions matrix.
 matrix-auth:latest
-
 
 # --- CI/CD Integration Plugins ---
 

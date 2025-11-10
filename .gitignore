@@ -1,1 +1,3 @@
 ca.pem
+*.env
+jenkins.env

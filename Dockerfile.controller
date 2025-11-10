@@ -3,21 +3,15 @@
 #               Dockerfile.controller
 #
 #  This blueprint builds our "Foreman" (Jenkins Controller).
-#  It starts from the base Jenkins image and adds two
-#  critical "first principles" enhancements:
 #
-#  1. DooD: It installs the Docker CLI and fixes the
-#     GID permissions, allowing the controller's
-#     "Docker Plugin" to spawn agents.
-#
-#  2. Plugins: It pre-installs all the plugins we need
-#     for our "enterprise-grade" workflow (JCasC,
-#     GitLab, Artifactory, etc.).
+#  1. DooD: Installs Docker CLI & fixes GID permissions.
+#  2. CA Trust: Bakes in our Local CA to the JVM trust store.
+#  3. Plugins: Installs all plugins from 'plugins.txt'.
 #
 # -----------------------------------------------------------
 
 # 1. Start from the official Jenkins Long-Term Support image
-FROM jenkins/jenkins:lts-jdk17
+FROM jenkins/jenkins:lts-jdk21
 LABEL authors="warren_jitsing"
 
 # 2. Accept the host's 'docker' GID as a build-time argument
@@ -26,7 +20,23 @@ ARG HOST_DOCKER_GID
 # 3. Switch to 'root' to install software and fix permissions
 USER root
 
-# 4. Install Docker CLI & Fix GID Mismatch
+# 4. Copy our Local CA cert from the build context
+# (Our '01-setup-jenkins.sh' will place this file here)
+COPY ca.pem /tmp/ca.pem
+
+# 5. Fix CA Trust (for both OS/git and JVM)
+# This is "baked in" for simplicity and robustness
+RUN cp /tmp/ca.pem /usr/local/share/ca-certificates/cicd-stack-ca.crt \
+    && update-ca-certificates \
+    && keytool -importcert \
+        -keystore /opt/java/openjdk/lib/security/cacerts \
+        -storepass changeit \
+        -file /tmp/ca.pem \
+        -alias "CICD-Root-CA" \
+        -noprompt \
+    && rm /tmp/ca.pem
+
+# 6. Install Docker CLI & Fix GID Mismatch
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         gnupg \
@@ -44,11 +54,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 5. Switch back to the unprivileged 'jenkins' user
+# 7. Switch back to the unprivileged 'jenkins' user
 USER jenkins
 
-# 6. Copy our plugin list into the official ref directory
+# 8. Copy our plugin list into the official ref directory
 COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
 
-# 7. Run the official plugin installer script
+# 9. Run the official plugin installer script
 RUN jenkins-plugin-cli -f /usr/share/jenkins/ref/plugins.txt
