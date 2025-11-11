@@ -66,7 +66,7 @@ docker run -d \
   --name "jenkins-controller" \
   --restart always \
   --network "cicd-net" \
-  --hostname "jenkins" \
+  --hostname "jenkins.cicd.local" \
   --publish "127.0.0.1:${JENKINS_HTTPS_PORT}:${JENKINS_HTTPS_PORT}" \
   --publish "127.0.0.1:${JENKINS_JNLP_PORT}:${JENKINS_JNLP_PORT}" \
   --env-file "$SCOPED_ENV_FILE" \

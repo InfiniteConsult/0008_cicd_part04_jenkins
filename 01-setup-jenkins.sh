@@ -79,8 +79,8 @@ mkdir -p "$SSL_DIR"
 
 # Define CA and Service Cert paths from Article 2
 CA_CERT_PATH="$HOME/cicd_stack/ca/pki/certs/ca.pem"
-SERVICE_CERT_PATH="$HOME/cicd_stack/ca/pki/services/jenkins/jenkins.crt.pem"
-SERVICE_KEY_PATH="$HOME/cicd_stack/ca/pki/services/jenkins/jenkins.key.pem"
+SERVICE_CERT_PATH="$HOME/cicd_stack/ca/pki/services/jenkins.cicd.local/jenkins.cicd.local.crt.pem"
+SERVICE_KEY_PATH="$HOME/cicd_stack/ca/pki/services/jenkins.cicd.local/jenkins.cicd.local.key.pem"
 P12_KEYSTORE_PATH="$SSL_DIR/jenkins.p12"
 
 # 4a. Copy 'ca.pem' into our build context for both Dockerfiles
@@ -209,7 +209,7 @@ jenkins:
             connector:
               jnlp:
                 # This 'jenkinsUrl' is for the *agent* to find the controller
-                jenkinsUrl: "https://jenkins:${JENKINS_HTTPS_PORT}/"
+                jenkinsUrl: "https://jenkins.cicd.local:${JENKINS_HTTPS_PORT}/"
 
 # --- Tool Configuration ---
 # This 'tool' block is at the ROOT level, not inside 'jenkins:'
@@ -236,7 +236,7 @@ unclassified:
   gitLabServers:
     servers:
       - name: "Local GitLab"
-        serverUrl: "https://gitlab:10300"
+        serverUrl: "https://gitlab.cicd.local:10300"
         credentialsId: "gitlab-api-token"
         # We don't need 'clientBuilderId' for this plugin,
         # but we do need to enable hook management.
