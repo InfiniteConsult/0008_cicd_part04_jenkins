@@ -200,6 +200,7 @@ jenkins:
             # The agent's working directory
             remoteFs: "/home/jenkins/agent"
             pullStrategy: 'PULL_NEVER'
+            removeVolumes: true
             # All base properties are nested inside dockerTemplateBase
             dockerTemplateBase:
               # The custom image we built
