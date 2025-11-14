@@ -75,22 +75,14 @@ RUN for version in $py312 $py313 $py314; do \
     done \
     && rm -rf /tmp/deps
 
-# 9. Install Rust and Julia toolchains
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y \
-    && . "$HOME/.cargo/env" \
-    && cargo install cargo-llvm-cov \
-    && curl -fsSL https://install.julialang.org | sh -s -- -y
-
-# 10. Install SonarScanner CLI
+# 9. Install SonarScanner CLI (as root)
 RUN wget -O /tmp/sonar.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189-linux-x64.zip" \
     && unzip /tmp/sonar.zip -d /opt \
     && mv /opt/sonar-scanner-* /opt/sonar-scanner \
     && ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/bin/sonar-scanner \
     && rm /tmp/sonar.zip
 
-# 11. Fix CA Trust (for both OS/git and JVM)
-# First, fix OS Trust (for git, curl, etc.)
-# Then, fix JVM Trust (for Java-based tools)
+# 10. Fix CA Trust (for both OS/git and JVM) (as root)
 RUN cp /tmp/ca.pem /usr/local/share/ca-certificates/cicd-stack-ca.crt \
     && update-ca-certificates \
     && keytool -importcert \
@@ -101,7 +93,21 @@ RUN cp /tmp/ca.pem /usr/local/share/ca-certificates/cicd-stack-ca.crt \
         -noprompt \
     && rm /tmp/ca.pem
 
-# 12. Switch back to the default agent user
+# 11. Switch to the default agent user
 USER jenkins
 
+# 12. Install user-specific toolchains (Rust and Julia)
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y \
+    && curl -fsSL https://install.julialang.org | sh -s -- -y
+
+# 13. Install cargo-llvm-cov
+# We must source the env file in the *same* command
+RUN . "$HOME/.cargo/env" && cargo install cargo-llvm-cov
+
+# 14. Add the new toolchains to the container's PATH
+# This ENV instruction makes them available to all subsequent
+# Jenkins 'sh' steps.
+ENV PATH="/home/jenkins/.cargo/bin:/home/jenkins/.juliaup/bin:${PATH}"
+
+# 15. Set the Entrypoint (must be last)
 ENTRYPOINT ["java", "-jar", "/usr/share/jenkins/agent.jar"]
