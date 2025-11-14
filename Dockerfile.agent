@@ -103,3 +103,5 @@ RUN cp /tmp/ca.pem /usr/local/share/ca-certificates/cicd-stack-ca.crt \
 
 # 12. Switch back to the default agent user
 USER jenkins
+
+ENTRYPOINT ["java", "-jar", "/usr/share/jenkins/agent.jar"]
