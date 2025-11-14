@@ -199,6 +199,7 @@ jenkins:
             labelString: "general-purpose-agent"
             # The agent's working directory
             remoteFs: "/home/jenkins/agent"
+            pullStrategy: 'PULL_NEVER'
             # All base properties are nested inside dockerTemplateBase
             dockerTemplateBase:
               # The custom image we built
