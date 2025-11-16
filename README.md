@@ -376,3 +376,518 @@ Let's deconstruct this:
         * **`image: "general-purpose-agent:latest"`**: The name of our custom-built image.
         * **`network: "cicd-net"`**: This is critical. It connects our agent to our private "city" network, allowing it to resolve `gitlab.cicd.local`.
     * **`connector:`**: This tells the agent *how* to find the Foreman. We give it the full JNLP URL: `https://jenkins.cicd.local:10400/`.
+
+### A Critical Note on JCasC and Credentials
+
+This `credentials:` block highlights a fundamental, and critical, part of our Configuration-as-Code architecture that we discovered during our testing.
+
+**1. The JCasC File is the Single Source of Truth**
+
+Our `jenkins.yaml` file is the *authoritative* definition of our Jenkins configuration. When the controller starts, the JCasC plugin reads this file and forces the system's configuration to match it.
+
+This means **any credentials you add manually via the UI will be lost** when the container is restarted or re-deployed. We experienced this ourselves: after manually adding our `gitlab-checkout-credentials` in the UI, a simple container restart wiped them out, causing our builds to fail again.
+
+The only way to create *permanent* credentials that survive restarts is to define them here, in our `jenkins.yaml` blueprint.
+
+**2. Understanding GitLab Tokens in JCasC**
+
+In our file, we are using two *different* credential *kinds* for two different GitLab tokens. This is a deliberate choice for our architecture:
+
+* **`string` (for `gitlab-api-token`):** This is a **Personal Access Token (PAT)** with `api` scope. It's used by the `gitlab-branch-source` plugin itself to scan repositories and report build statuses. The plugin is designed to read a `string` (or "Secret Text") credential.
+
+* **`usernamePassword` (for `gitlab-checkout-credentials`):** This is a **Project Access Token (PAT)** with a much more limited `read_repository` scope. This is the token our pipeline's `git clone` command will use. We use the `usernamePassword` type because it's what the Git checkout step expects.
+    * **The `username` is just a label.** GitLab's token auth does not care what is in the `username` field (`gitlab-checkout-bot`). It only cares about the token. We are putting the token in the `password` field, which is what `git` will present to the server.
+
+You can use a Personal, Group, or Project token for the `usernamePassword` credential. Our choice to use a **Project Access Token** here is an example of the **Principle of Least Privilege**: the build pipeline only gets permission to *read this one project*, not our entire GitLab instance.
+
+
+# Chapter 6: Action Plan (Part 3) – The "Architect, Build, Deploy" Scripts
+
+With our "blueprints" (`Dockerfiles`) and "factory layout" (the `jenkins.yaml` design) complete, it's time to execute our plan. We will use a three-script "Architect, Build, Deploy" pattern, just as we did for our previous services.
+
+This separates our logic cleanly:
+
+1.  **`01-setup-jenkins.sh`**: The "Architect" script that runs on the host to *prepare* all configuration.
+2.  **`02-build-images.sh`**: The "Build" script that *creates* our custom Docker images.
+3.  **`03-deploy-controller.sh`**: The "Deploy" script that *runs* the Jenkins controller.
+
+Let's start with the "Architect."
+
+## 6.1. The "Architect" Script (`01-setup-jenkins.sh`)
+
+This is our master setup script. Its sole purpose is to run on the host machine and generate *all* the configuration "artifacts" our other scripts and Dockerfiles will need. It's the "blueprint processor" that assembles all our plans and secrets into ready-to-use files.
+
+Here is the complete script.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               01-setup-jenkins.sh
+#
+#  This is the master "architect" script for Jenkins.
+#
+#  It runs *once* on the host machine to generate all the
+#  "blueprints" (JCasC, etc.) needed to deploy our Controller.
+#
+#  1. Scoped Env: Creates a 'jenkins.env' file.
+#  2. Keystore:   Generates the 'jenkins.p12' Java keystore.
+#  3. JCasC:      Writes the 'jenkins.yaml' file with the
+#                 correct Docker Cloud syntax.
+#  4. CA Trust:   Copies 'ca.pem' into the build context
+#     for both Dockerfiles to use.
+#
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Starting Jenkins 'Architect' Setup..."
+
+# --- 1. Define Core Paths & Variables ---
+
+# This is our main config directory from Article 1
+JENKINS_CONFIG_DIR="$HOME/cicd_stack/jenkins/config"
+
+# This is our Jenkins build context (current directory)
+BUILD_CONTEXT_DIR=$(pwd)
+
+# Master "Secrets" file from Article 1
+MASTER_ENV_FILE="$HOME/cicd_stack/cicd.env"
+
+# Source the master secrets file to load them into this script
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "⛔ ERROR: Master env file not found at $MASTER_ENV_FILE"
+    exit 1
+fi
+source "$MASTER_ENV_FILE"
+
+# --- 2. Define Ports & Passwords ---
+# We will use the 104xx block for Jenkins
+JENKINS_HTTPS_PORT="10400"
+JENKINS_JNLP_PORT="10401"
+
+# Generate passwords if they aren't set in the env file
+: "${JENKINS_ADMIN_PASSWORD:="admin-$(openssl rand -hex 8)"}"
+: "${JENKINS_KEYSTORE_PASSWORD:="key-$(openssl rand -hex 12)"}"
+
+echo "🔧 Jenkins Ports Set:"
+echo "   - UI (HTTPS): $JENKINS_HTTPS_PORT"
+echo "   - Agent (JNLP): $JENKINS_JNLP_PORT"
+
+# --- 3. Create "Scoped" jenkins.env File ---
+# This is our "Least Privilege" secrets file for the container
+SCOPED_ENV_FILE="$BUILD_CONTEXT_DIR/jenkins.env"
+echo "🔑 Creating scoped 'jenkins.env' file..."
+cat << EOF > "$SCOPED_ENV_FILE"
+# This file is auto-generated by 01-setup-jenkins.sh
+# It contains *only* the secrets needed by Jenkins.
+
+# --- JCasC Variables ---
+JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
+GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
+GITLAB_CHECKOUT_TOKEN=${GITLAB_CHECKOUT_TOKEN}
+
+# --- Keystore Password ---
+JENKINS_KEYSTORE_PASSWORD=${JENKINS_KEYSTORE_PASSWORD}
+EOF
+grep -qxF "jenkins.env" .gitignore || echo "jenkins.env" >> .gitignore
+echo "   Done."
+
+# --- 4. Prepare Certificate Assets ---
+echo "🔐 Preparing SSL certificates..."
+
+# Create directories for the Keystore
+SSL_DIR="$JENKINS_CONFIG_DIR/ssl"
+mkdir -p "$SSL_DIR"
+
+# Define CA and Service Cert paths from Article 2
+CA_CERT_PATH="$HOME/cicd_stack/ca/pki/certs/ca.pem"
+SERVICE_CERT_PATH="$HOME/cicd_stack/ca/pki/services/jenkins.cicd.local/jenkins.cicd.local.crt.pem"
+SERVICE_KEY_PATH="$HOME/cicd_stack/ca/pki/services/jenkins.cicd.local/jenkins.cicd.local.key.pem"
+P12_KEYSTORE_PATH="$SSL_DIR/jenkins.p12"
+
+# 4a. Copy 'ca.pem' into our build context for both Dockerfiles
+# This will be .gitignore'd
+cp "$CA_CERT_PATH" "$BUILD_CONTEXT_DIR/ca.pem"
+grep -qxF "ca.pem" .gitignore || echo "ca.pem" >> .gitignore
+
+# 4b. Create the .p12 Java Keystore for the Controller's UI
+echo "   Generating 'jenkins.p12' Java Keystore..."
+openssl pkcs12 -export \
+    -in "$SERVICE_CERT_PATH" \
+    -inkey "$SERVICE_KEY_PATH" \
+    -name jenkins \
+    -out "$P12_KEYSTORE_PATH" \
+    -passout "pass:${JENKINS_KEYSTORE_PASSWORD}"
+echo "   Done."
+
+
+# --- 5. Generate JCasC 'jenkins.yaml' ---
+JCAS_FILE="$JENKINS_CONFIG_DIR/jenkins.yaml"
+echo "📝 Generating 'jenkins.yaml' (JCasC) blueprint..."
+cat << EOF > "$JCAS_FILE"
+#
+# This file is auto-generated by 01-setup-jenkins.sh
+# It is the "factory layout" (JCasC) for our Jenkins Controller.
+#
+jenkins:
+  # Set the system message
+  systemMessage: "Jenkins Controller - CI/CD Stack - ${HOSTNAME}"
+
+  # This is the fix for the "built-in node" security warning
+  numExecutors: 0
+
+  # Configure our JNLP agent port
+  slaveAgentPort: ${JENKINS_JNLP_PORT}
+
+  # --- Security Configuration ---
+  # Use the modern, nested 'entries' syntax
+  authorizationStrategy:
+    globalMatrix:
+      entries:
+        # Grant 'admin' full administrator permissions
+        - user:
+            name: "admin"
+            permissions:
+              - "Overall/Administer"
+              - "Overall/Read"
+              - "Agent/Build"
+              - "Agent/Configure"
+              - "Agent/Connect"
+              - "Agent/Create"
+              - "Agent/Delete"
+              - "Agent/Disconnect"
+              - "Credentials/Create"
+              - "Credentials/Delete"
+              - "Credentials/ManageDomains"
+              - "Credentials/Update"
+              - "Credentials/View"
+              - "Job/Build"
+              - "Job/Cancel"
+              - "Job/Configure"
+              - "Job/Create"
+              - "Job/Delete"
+              - "Job/Discover"
+              - "Job/Move"
+              - "Job/Read"
+              - "Job/Workspace"
+              - "Run/Delete"
+              - "Run/Replay"
+              - "Run/Update"
+              - "View/Configure"
+              - "View/Create"
+              - "View/Delete"
+              - "View/Read"
+        # Grant 'anonymous' read-only access
+        - group:
+            name: "anonymous"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+              - "Job/Discover"
+        # Grant 'authenticated' (all logged-in users) basic job rights
+        - group:
+            name: "authenticated"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+              - "Job/Build"
+              - "Job/Discover"
+
+  # 'securityRealm' is a child of 'jenkins:'
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        # Create our 'admin' user with the password from our .env file
+        - id: "admin"
+          password: "\${JENKINS_ADMIN_PASSWORD}"
+
+  # --- Cloud Configuration (The "Hiring Department") ---
+  # 'clouds' is a valid top-level attribute of 'jenkins:'
+  clouds:
+    - docker:
+        name: "docker-local"
+        # Point to the DooD socket (permissions fixed in Dockerfile)
+        dockerApi:
+          dockerHost:
+            uri: "unix:///var/run/docker.sock"
+        # Define our "General Purpose Worker" template
+        templates:
+          - name: "general-purpose-agent"
+            # This is the correct attribute for the label
+            labelString: "general-purpose-agent"
+            # The agent's working directory
+            remoteFs: "/home/jenkins/agent"
+            pullStrategy: 'PULL_NEVER'
+            dockerCommand: ""
+            removeVolumes: true
+            # All base properties are nested inside dockerTemplateBase
+            dockerTemplateBase:
+              # The custom image we built
+              image: "general-purpose-agent:latest"
+              # The "road network" for our city
+              network: "cicd-net"
+            # The connector stays at the top level
+            connector:
+              jnlp:
+                # This 'jenkinsUrl' is for the *agent* to find the controller
+                jenkinsUrl: "https://jenkins.cicd.local:${JENKINS_HTTPS_PORT}/"
+
+# --- Tool Configuration ---
+# This 'tool' block is at the ROOT level, not inside 'jenkins:'
+tool:
+  git:
+    installations:
+      - name: "Default"
+        home: "git"
+
+# --- Credentials Configuration ---
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              id: "gitlab-api-token"
+              scope: GLOBAL
+              description: "GitLab API Token for Jenkins"
+              secret: "\${GITLAB_API_TOKEN}"
+          - usernamePassword:
+              id: "gitlab-checkout-credentials"
+              scope: GLOBAL
+              description: "GitLab Project Token for repo checkout"
+              username: "gitlab-checkout-bot"
+              password: "\${GITLAB_CHECKOUT_TOKEN}"
+
+# --- Plugin Configuration (The "Bridge" to GitLab) ---
+unclassified:
+  # The correct JCasC root for 'gitlab-branch-source' is 'gitLabServers'
+  gitLabServers:
+    servers:
+      - name: "Local GitLab"
+        serverUrl: "https://gitlab.cicd.local:10300"
+        credentialsId: "gitlab-api-token"
+        # We don't need 'clientBuilderId' for this plugin,
+        # but we do need to enable hook management.
+        manageWebHooks: true
+        manageSystemHooks: false
+EOF
+echo "   Done."
+echo "✅ Jenkins 'Architect' setup is complete."
+echo "   All blueprints (JCasC, env) are generated."
+echo "   All certs are staged in the correct locations."
+echo "   You can now run '02-build-images.sh'."
+```
+
+### Deconstructing the "Architect" Script
+
+This script performs five critical setup tasks before we ever build an image or run a container.
+
+1.  **Sources the Master `cicd.env` File:** It pulls in all our master secrets (like `GITLAB_API_TOKEN`) so it can use them to populate other files.
+2.  **Creates a "Scoped" `jenkins.env` File:** This is a key security practice. Instead of passing all our secrets to the controller, this creates a new `jenkins.env` file that contains *only* the secrets Jenkins needs: its admin password, the GitLab API token, the checkout token, and the keystore password. This file is what we'll pass to our container.
+3.  **Copies the `ca.pem`:** It copies our CA certificate from Article 2 into the current directory. Our `Dockerfile.controller` and `Dockerfile.agent` will `COPY` this file to "bake in" trust.
+4.  **Generates the `.p12` Keystore:** This is the Java SSL solution from Chapter 3. It runs the `openssl pkcs12 -export` command, bundling our `jenkins.cicd.local` certificate and key into the `jenkins.p12` file that the controller's web server can understand.
+5.  **Generates the `jenkins.yaml` JCasC File:** This is the script's main job. It writes our entire "factory layout" to `jenkins.yaml`, programmatically inserting our port numbers (`$JENKINS_HTTPS_PORT`) and using the `\${VARIABLE}` syntax to template the secrets. This generated file is the complete, final blueprint for our controller.
+
+
+
+## 6.2. The "Build" Script (`02-build-images.sh`)
+
+With our "Architect" script having prepared all the blueprints and staged the `ca.pem` file, we're ready to "build" our images. This script's job is to run the `docker build` commands, feeding our `Dockerfiles` all the build-time arguments they need.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               02-build-images.sh
+#
+#  This is the "build" script. It builds our two custom
+#  Docker images:
+#
+#  1. jenkins-controller: The "Foreman" (UI)
+#  2. general-purpose-agent: The "Worker" (Build Tools)
+#
+#  It's responsible for finding the host's 'docker' GID
+#  and passing all the correct build-time arguments to
+#  each Dockerfile.
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Starting Jenkins Image Build..."
+
+# --- 1. Find Host Docker GID ---
+# We need this for the "build-time" GID fix in Dockerfile.controller
+HOST_DOCKER_GID=$(getent group docker | cut -d: -f3)
+
+if [ -z "$HOST_DOCKER_GID" ]; then
+    echo "⛔ ERROR: 'docker' group not found on host."
+    echo "Please ensure the docker group exists and your user is a member."
+    exit 1
+fi
+echo "🔧 Host 'docker' GID found: $HOST_DOCKER_GID"
+
+# --- 2. Define Toolchain Build Arguments ---
+# These ARGs must match what Dockerfile.agent expects
+PY312="3.12.12"
+PY313="3.13.9"
+PY314="3.14.0"
+GCC15="15.2.0"
+
+# --- 3. Build the Controller Image ---
+echo "--- Building 'jenkins-controller:latest' ---"
+docker build --progress=plain \
+  --build-arg HOST_DOCKER_GID=$HOST_DOCKER_GID \
+  -f Dockerfile.controller \
+  -t jenkins-controller:latest .
+echo "✅ 'jenkins-controller' build complete."
+
+
+# --- 4. Build the Agent Image ---
+echo "--- Building 'general-purpose-agent:latest' ---"
+docker build --progress=plain \
+  --build-arg py312=$PY312 \
+  --build-arg py313=$PY313 \
+  --build-arg py314=$PY314 \
+  --build-arg gcc15=$GCC15 \
+  -f Dockerfile.agent \
+  -t general-purpose-agent:latest .
+echo "✅ 'general-purpose-agent' build complete."
+
+echo "🎉 Both Jenkins images are built and ready."
+echo "   You can now run '03-deploy-controller.sh'."
+```
+
+### Deconstructing the "Build" Script
+
+This script is straightforward but performs one vital task:
+
+1.  **Find Host Docker GID:** The script starts by finding the numerical GID of the `docker` group on the host. This is the solution to our DooD permission challenge.
+2.  **Build the Controller Image:** It runs the first `docker build` command, using `-f Dockerfile.controller` to specify our "Foreman" blueprint. Critically, it passes the `--build-arg HOST_DOCKER_GID=$HOST_DOCKER_GID` flag. This injects the host's GID into the build, allowing our `Dockerfile.controller` to "bake in" the correct permissions.
+3.  **Build the Agent Image:** It runs the second `docker build` command, using `-f Dockerfile.agent`. This build doesn't need the GID but *does* need the toolchain version arguments (`PY312`, `GCC15`, etc.), which we've hardcoded here to match our `dev-container` environment.
+
+With this script, we now have two custom images, `jenkins-controller:latest` and `general-purpose-agent:latest`, built locally and ready for deployment.
+
+-----
+
+## 6.3. The "Deploy" Script (`03-deploy-controller.sh`)
+
+This is the final assembly. This script takes our newly built `jenkins-controller` image and launches it as a container, connecting all the pieces we've built across this entire series. It connects our network, mounts our configs, passes our secrets, and enables our security.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               03-deploy-controller.sh
+#
+#  This is the "deploy" script. It runs the 'docker run'
+#  command to launch our 'jenkins-controller' container.
+#
+#  It's responsible for connecting all our "first principles"
+#  components together:
+#
+#  1. Network:    Connects to 'cicd-net' with hostname 'jenkins'.
+#  2. Ports:      Publishes the UI (10400) and Agent (10401) ports.
+#  3. Secrets:    Passes the *scoped* 'jenkins.env' file.
+#  4. Volumes:    Mounts our JCasC config, our .p12 keystore,
+#                 the 'jenkins-home' data volume, and the
+#                 'docker.sock' for DooD.
+#  5. HTTPS:      Passes 'JENKINS_OPTS' to enable SSL using
+#                 our .p12 keystore and its password.
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Jenkins Controller..."
+
+# --- 1. Define Paths ---
+JENKINS_CONFIG_DIR="$HOME/cicd_stack/jenkins/config"
+SCOPED_ENV_FILE="$(pwd)/jenkins.env"
+
+# --- 2. Stop and Remove Old Container (if it exists) ---
+# This ensures a clean start
+if [ "$(docker ps -q -f name=jenkins-controller)" ]; then
+    echo "Stopping existing 'jenkins-controller'..."
+    docker stop jenkins-controller
+fi
+if [ "$(docker ps -aq -f name=jenkins-controller)" ]; then
+    echo "Removing existing 'jenkins-controller'..."
+    docker rm jenkins-controller
+fi
+
+# --- 3. Source Keystore Password from Scoped Env File ---
+# We need this *one* variable on the host to build the JENKINS_OPTS string
+if [ ! -f "$SCOPED_ENV_FILE" ]; then
+    echo "⛔ ERROR: Scoped 'jenkins.env' file not found."
+    echo "Please run '01-setup-jenkins.sh' first."
+    exit 1
+fi
+# Source the file to load its variables into our script
+source "$SCOPED_ENV_FILE"
+
+if [ -z "$JENKINS_KEYSTORE_PASSWORD" ]; then
+    echo "⛔ ERROR: JENKINS_KEYSTORE_PASSWORD not found in 'jenkins.env'."
+    exit 1
+fi
+
+echo "🔐 Keystore password loaded."
+
+# --- 4. Define Ports (from our 01-setup.sh) ---
+JENKINS_HTTPS_PORT="10400"
+JENKINS_JNLP_PORT="10401"
+
+# --- 5. Run the Controller Container ---
+echo "--- Starting 'jenkins-controller' container ---"
+
+docker run -d \
+  --name "jenkins-controller" \
+  --restart always \
+  --network "cicd-net" \
+  --hostname "jenkins.cicd.local" \
+  --publish "127.0.0.1:${JENKINS_HTTPS_PORT}:${JENKINS_HTTPS_PORT}" \
+  --publish "127.0.0.1:${JENKINS_JNLP_PORT}:${JENKINS_JNLP_PORT}" \
+  --env-file "$SCOPED_ENV_FILE" \
+  --env "CASC_JENKINS_CONFIG=/var/jenkins_home/casc_configs/" \
+  --volume "jenkins-home:/var/jenkins_home" \
+  --volume "$JENKINS_CONFIG_DIR:/var/jenkins_home/casc_configs:ro" \
+  --volume "/var/run/docker.sock:/var/run/docker.sock" \
+  --env JENKINS_OPTS="--httpPort=-1 \
+--httpsPort=${JENKINS_HTTPS_PORT} \
+--httpsKeyStore=/var/jenkins_home/casc_configs/ssl/jenkins.p12 \
+--httpsKeyStorePassword=${JENKINS_KEYSTORE_PASSWORD} \
+--webroot=/var/jenkins_home/war \
+--sessionTimeout=3600 \
+--sessionEviction=3600" \
+  jenkins-controller:latest
+
+# We no longer override the entrypoint. The image will
+# run its default 'jenkins.sh' command.
+
+echo "✅ Jenkins Controller is starting."
+echo "   Monitor logs with: docker logs -f jenkins-controller"
+echo ""
+echo "   Wait for the 'Jenkins is fully up and running' log message."
+echo "   Then, access the UI at: https://jenkins.cicd.local:10400"
+echo "   (Remember to add '127.0.0.1 jenkins.cicd.local' to your /etc/hosts file!)"
+```
+
+### Deconstructing the "Deploy" Script
+
+This `docker run` command is the final assembly of our entire architecture:
+
+* `--network "cicd-net"` & `--hostname "jenkins.cicd.local"`: Connects our "Foreman" to our "city" network and gives it the FQDN that our CA certificate and GitLab are expecting.
+* `--publish "127.0.0.1:..."`: Binds the UI (`10400`) and JNLP (`10401`) ports *only* to the host's `localhost` interface for security.
+* `--env-file "$SCOPED_ENV_FILE"`: Passes in our "scoped" `jenkins.env` file, providing all the `${...}` variables that our `jenkins.yaml` needs for secrets.
+* `--env "CASC_JENKINS_CONFIG=..."`: This is the magic flag that activates the JCasC plugin and tells it *where* to find our `jenkins.yaml` file.
+* `--volume "jenkins-home:..."`: Connects our Docker-managed volume (from Article 1) to store all of Jenkins's data (jobs, build history, etc.).
+* `--volume "$JENKINS_CONFIG_DIR:..."`: This is our JCasC mount. We mount our host's `config` directory (which contains our `jenkins.yaml` and the `ssl/jenkins.p12` keystore) into the location specified by `CASC_JENKINS_CONFIG`.
+* `--volume "/var/run/docker.sock:..."`: This provides the DooD capability, allowing the controller to spawn agents.
+* **The Missing Flag:** Notice there is no `--group-add` flag. Because we "baked" the GID fix into our `Dockerfile.controller`, this runtime flag is no longer necessary.
+* `--env JENKINS_OPTS="..."`: This is the final and most critical piece. We use this environment variable to pass start-up commands to the Jenkins Java process. We tell it:
+    * `--httpPort=-1`: **Disable HTTP entirely.**
+    * `--httpsPort=${JENKINS_HTTPS_PORT}`: Enable HTTPS on our specified port.
+    * `--httpsKeyStore=...`: Point to the `.p12` keystore file we just mounted.
+    * `--httpsKeyStorePassword=...`: Provide the password (which we sourced from `jenkins.env`) to unlock the keystore.
+
+This command launches our controller, which will now boot up, read our `jenkins.yaml`, configure itself, and be fully secured with our custom SSL certificate.
+

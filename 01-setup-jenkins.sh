@@ -253,12 +253,6 @@ unclassified:
         manageSystemHooks: false
 EOF
 echo "   Done."
-
-
-# --- STEP 6 (DELETED) ---
-# We no longer generate a 'custom-entrypoint.sh'
-# All fixes are now "baked in" to the Dockerfiles.
-
 echo "✅ Jenkins 'Architect' setup is complete."
 echo "   All blueprints (JCasC, env) are generated."
 echo "   All certs are staged in the correct locations."
