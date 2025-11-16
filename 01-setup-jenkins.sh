@@ -63,6 +63,7 @@ cat << EOF > "$SCOPED_ENV_FILE"
 # --- JCasC Variables ---
 JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
 GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
+GITLAB_CHECKOUT_TOKEN=${GITLAB_CHECKOUT_TOKEN}
 
 # --- Keystore Password ---
 JENKINS_KEYSTORE_PASSWORD=${JENKINS_KEYSTORE_PASSWORD}
@@ -231,6 +232,12 @@ credentials:
               scope: GLOBAL
               description: "GitLab API Token for Jenkins"
               secret: "\${GITLAB_API_TOKEN}"
+          - usernamePassword:
+              id: "gitlab-checkout-credentials"
+              scope: GLOBAL
+              description: "GitLab Project Token for repo checkout"
+              username: "gitlab-checkout-bot"
+              password: "\${GITLAB_CHECKOUT_TOKEN}"
 
 # --- Plugin Configuration (The "Bridge" to GitLab) ---
 unclassified:

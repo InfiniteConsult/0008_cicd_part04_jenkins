@@ -370,7 +370,7 @@ Let's deconstruct this:
 * **`templates:`**: This is the list of "worker types" our Foreman can hire. We define one:
     * **`labelString: "general-purpose-agent"`**: This is the "job title." Our `Jenkinsfile` will request a worker with this label (`agent { label 'general-purpose-agent' }`).
     * **`pullStrategy: 'PULL_NEVER'`**: This was a key discovery. It tells Jenkins to *never* try to pull the image from Docker Hub and to *only* use the local `general-purpose-agent:latest` image we built.
-    * **`dockerCommand: ""`**: This was our *other* major debugging fix. It tells the plugin to *not* override the container's `ENTRYPOINT`, which is what finally solved our `exec: "-url": executable file not found` error.
+    * **`dockerCommand: ""`**: This was our *other* major debugging fix. It tells the plugin to *not* override the container's `ENTRYPOINT`, which is what we thought would finally solve our `exec: "-url": executable file not found` error.
     * **`removeVolumes: true`**: This is a cleanup fix. It tells Jenkins to delete the agent's anonymous volumes when the container is removed, preventing our host from filling up with orphaned volumes.
     * **`dockerTemplateBase:`**: This defines the agent's runtime.
         * **`image: "general-purpose-agent:latest"`**: The name of our custom-built image.
