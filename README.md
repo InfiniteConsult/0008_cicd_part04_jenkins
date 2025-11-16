@@ -891,3 +891,432 @@ This `docker run` command is the final assembly of our entire architecture:
 
 This command launches our controller, which will now boot up, read our `jenkins.yaml`, configure itself, and be fully secured with our custom SSL certificate.
 
+# Chapter 7: Verification & First Login
+
+With our `03-deploy-controller.sh` script running, the Jenkins controller will take a few minutes to boot, load all the plugins, and process our `jenkins.yaml` file. You can monitor this process with `docker logs -f jenkins-controller`. Once you see the "Jenkins is fully up and running" log message, our "Foreman" is ready for inspection.
+
+-----
+
+## 7.1. Verification (UI): First Login & The JCasC Payoff
+
+First, we'll verify the User Interface. Open your browser and navigate to the controller's FQDN:
+
+**`https://jenkins.cicd.local:10400`**
+
+(Remember, this only works because you've edited your `/etc/hosts` file, as we did in the GitLab article).
+
+You should immediately see three signs of success:
+
+1.  **A Secure Lock Icon:** Your browser trusts the Jenkins UI. This proves our entire SSL chain is working: your host's OS trusts our Local CA (from Article 2), and the controller is correctly serving its `jenkins.p12` keystore (from our `JENKINS_OPTS` flag).
+2.  **No "Unlock Jenkins" Screen:** The JCasC plugin has worked. We are not asked to find a secret password in a log file.
+3.  **A Login Page:** We are taken directly to the login page.
+
+Now, log in using the credentials we defined in our `jenkins.yaml` file (via the `jenkins.env`):
+
+* **Username:** `admin`
+* **Password:** (The `JENKINS_ADMIN_PASSWORD` you set)
+
+Once logged in, let's confirm JCasC did its job. Navigate to **Manage Jenkins** in the left sidebar:
+
+* **Check Credentials:** Go to **Credentials**. You should see our two JCasC-defined credentials: **`gitlab-api-token`** and **`gitlab-checkout-credentials`**. This proves the `credentials:` block worked.
+* **Check Cloud Config:** Go to **Clouds**. You will see our **`docker-local`** cloud. Click **Configure**. You'll see it's correctly set up to use our `general-purpose-agent` and `cicd-net`. This proves the `clouds:` block worked.
+
+-----
+
+## 7.2. Verification (API): The `403 Forbidden` Debugging Journey
+
+The UI is working, but the most critical verification is to test the API. We will use our `04-verify-jenkins.py` script to do this.
+
+This verification was one of our most complex debugging challenges. Our first attempts to connect—even with a valid user and password—failed with an `HTTP Error 403: Forbidden`. This wasn't an *authentication* failure (the server knew who we were); it was an *authorization* failure (it was blocking our request).
+
+Our investigation revealed two key facts about the Jenkins API:
+
+1.  **API Tokens are Required:** Jenkins blocks password-based authentication for most of its API, especially high-security endpoints like `/scriptText`. The correct way to authenticate is with an API Token.
+2.  **`urllib` Auth is Complex:** Our attempts to use `urllib`'s "smart" handlers (like `HTTPBasicAuthHandler` and `HTTPCookieProcessor`) created a state-management conflict. The handlers would send a session cookie *and* a token, or a token *and* a crumb, confusing the server and resulting in a 403.
+
+The solution was to stop being "smart" and to be explicit. We must **manually build the `Authorization: Basic` header** ourselves and send *only* that. This is the most direct and reliable way to authenticate.
+
+### Action 1: Manually Generate an API Token
+
+First, we must generate the API token for our `admin` user. JCasC cannot do this for us.
+
+1.  In the Jenkins UI, click your `admin` username (top right).
+2.  In the left-hand sidebar, click **Security**.
+3.  Find the **"API Token"** section.
+4.  Click **"Add new Token"**, give it a name (like `admin-api-token`), and click **"Generate"**.
+5.  **Copy the generated token immediately.** You will not see it again.
+6.  Open your `jenkins.env` file (in your `0008_...` article directory) and add this token as `JENKINS_API_TOKEN`. (Our `01-setup-jenkins.sh` already added `GITLAB_CHECKOUT_TOKEN`, but we must add this one manually).
+
+### Action 2: Run the Verification Script
+
+The following script, `04-verify-jenkins.py`, is our final, working solution. It reads the `JENKINS_API_TOKEN` from our `jenkins.env` file, manually base64-encodes it into a Basic Auth header, and sends it with a simple Groovy script to test our access.
+
+```python
+#!/usr/bin/env python3
+
+import os
+import ssl
+import json
+import urllib.request
+import urllib.parse
+import base64
+from pathlib import Path
+
+# --- Configuration ---
+ENV_FILE_PATH = Path.cwd() / "jenkins.env"
+JENKINS_URL = "https://jenkins.cicd.local:10400"
+JENKINS_USER = "admin"
+
+# --- 1. Standard Library .env parser ---
+def load_env(env_path):
+    """
+    Reads a .env file and loads its variables into os.environ.
+    """
+    print(f"Loading environment from: {env_path}")
+    if not env_path.exists():
+        print(f"⛔ ERROR: Environment file not found at {env_path}")
+        print("Please run '01-setup-jenkins.sh' first.")
+        return False
+
+    with open(env_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"\'')
+                os.environ[key] = value
+    return True
+
+# --- 2. Main Verification ---
+def verify_jenkins_api(base_url, username, api_token):
+    """
+    Connects to Jenkins using a manually-crafted Basic Auth
+    header (token) and attempts an authenticated API call.
+    This method does not use or need a CSRF crumb.
+    """
+
+    print("Creating default SSL context...")
+    # This proves our host's CA trust (from Article 2) is working
+    context = ssl.create_default_context()
+
+    print("Attempting authenticated API call (Groovy script)...")
+    script_url = f"{base_url}/scriptText"
+
+    # This simple script just tests the connection.
+    groovy_script = "return jenkins.model.Jenkins.get().getSystemMessage()"
+    data = urllib.parse.urlencode({'script': groovy_script}).encode('utf-8')
+
+    # --- Manually build the Authorization Header ---
+    # This was the solution to our 403 Forbidden errors.
+    auth_string = f"{username}:{api_token}"
+    auth_bytes = auth_string.encode('utf-8')
+    auth_base64 = base64.b64encode(auth_bytes).decode('ascii')
+
+    headers = {
+        'Authorization': f"Basic {auth_base64}",
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    # We do NOT send a Jenkins-Crumb header.
+
+    req = urllib.request.Request(script_url, data=data, headers=headers, method='POST')
+
+    try:
+        # We use the default urlopen, passing our context.
+        with urllib.request.urlopen(req, context=context) as response:
+            if response.status == 200:
+                result = response.read().decode()
+                print(f"✅✅✅ Jenkins Verification SUCCESS! ✅✅✅")
+                print(f"Authenticated API call returned: {result}")
+            else:
+                print(f"⛔ ERROR: API call failed. Status: {response.status}")
+                print(f"   Response: {response.read().decode()}")
+
+    except urllib.error.URLError as e:
+        print(f"⛔ ERROR: Connection failed. Did you add '127.0.0.1 jenkins.cicd.local' to /etc/hosts?")
+        print(f"   Details: {e}")
+        if hasattr(e, 'read'):
+            print(f"  Response: {e.read().decode()}")
+    except Exception as e:
+        print(f"⛔ ERROR: API call failed.")
+        print(f"   Details: {e}")
+        if hasattr(e, 'read'):
+            print(f"  Response: {e.read().decode()}")
+
+# --- 6. Main execution ---
+if __name__ == "__main__":
+    if not load_env(ENV_FILE_PATH):
+        exit(1)
+
+    JENKINS_TOKEN = os.getenv('JENKINS_API_TOKEN')
+
+    if not JENKINS_TOKEN:
+        print("⛔ ERROR: JENKINS_API_TOKEN not found in 'jenkins.env'")
+        print("Please generate one in the UI and add it to the file.")
+        exit(1)
+
+    verify_jenkins_api(JENKINS_URL, JENKINS_USER, JENKINS_TOKEN)
+```
+
+### The Payoff
+
+When you run this script (`python3 04-verify-jenkins.py`), you will see the successful output. This proves our API is accessible, our token is valid, and our JCasC-defined `admin` user has the correct `Overall/Administer` permissions to access the script console. Our "Foreman" is fully operational and ready to work.
+
+
+# Chapter 8: Practical Application - The "Hero Project" Pipeline (V1)
+
+Our "Factory Foreman" (Jenkins) is fully operational. We've verified its UI is secure, its API is accessible, and its "hiring department" (the Docker Cloud) is correctly configured. The infrastructure is complete.
+
+Now it's time to put it to work.
+
+The goal of this chapter is to connect our "Factory" to our "Central Library" (GitLab) and run our first *real* build. We will connect Jenkins to our `0004_std_lib_http_client` "hero project" and use its "polyglot" build agent to compile, test, and run our C++, Rust, and Python code.
+
+-----
+
+## 8.1. Action 1: The `Jenkinsfile` (V1)
+
+Our first step is to create the "assembly line" instructions. As we discussed in Chapter 2, these instructions live *with the code*. We will create a new file named `Jenkinsfile` (with no extension) in the root of our `0004_std_lib_http_client` repository.
+
+This file is a "declarative pipeline" script. It tells the Jenkins agent *what* to do and in *what order*. Here is the complete V1 `Jenkinsfile` for our project.
+
+```groovy
+// Jenkinsfile
+
+pipeline {
+    // 1. Define our "Worker"
+    // This tells Jenkins to spin up our custom-built agent
+    // which already has all system dependencies (cmake, rust, python).
+    agent {
+        label 'general-purpose-agent'
+    }
+
+    stages {
+        // 2. Setup & Build Stage
+        // This runs the project's own setup.sh.
+        // It will create the Python venv, install pip requirements,
+        // and compile both the Debug and Release builds.
+        stage('Setup & Build') {
+            steps {
+                echo '--- Running project setup.sh ---'
+                sh 'chmod +x ./setup.sh'
+                sh './setup.sh'
+            }
+        }
+
+        // 3. Test & Coverage Stage
+        // This runs the project's coverage script, which
+        // depends on the 'build_debug' created in the prior stage.
+        stage('Test & Coverage') {
+            steps {
+                echo '--- Running CTest, Cargo-Cov, and Pytest ---'
+                sh 'chmod +x ./run-coverage.sh'
+                sh './run-coverage.sh'
+            }
+        }
+    }
+}
+```
+
+### Deconstructing the `Jenkinsfile`
+
+This simple file is incredibly powerful because it leans on the work we've already done.
+
+* **`agent { label 'general-purpose-agent' }`**
+  This is the "hiring" instruction. It tells the Jenkins controller to request a new "worker" from the cloud named `docker-local` that has the label `general-purpose-agent`. This label matches *exactly* what we defined in our `jenkins.yaml` file, which in turn points to our `general-purpose-agent:latest` Docker image.
+
+* **`stage('Setup & Build')`**
+  This is our first assembly line station. Instead of cluttering our pipeline with `cmake` and `python` commands, we simply make our scripts executable (`chmod +x`) and run the project's own `setup.sh`. This is a clean separation of concerns: the `Jenkinsfile` orchestrates *what* to do, and the `setup.sh` script knows *how* to do it. This stage will create the Python venv and build both the Debug and Release versions of our libraries.
+
+* **`stage('Test & Coverage')`**
+  This is our "quality assurance" station. Once the build is complete, it runs the `run-coverage.sh` script. This script executes all three test suites (C/C++ `ctest`, Rust `cargo llvm-cov`, and Python `pytest`) against the `build_debug` directory created in the previous stage.
+
+Now, **add this `Jenkinsfile` to the root of your `0004_std_lib_http_client` project, commit it, and push it to your GitLab server.**
+
+Our "blueprint" is now in the "Library," waiting for the "Foreman" to find it.
+
+### A Note on Credentials: Creating Your Project Access Token
+
+Before our `Jenkinsfile` can work, it needs permission to clone our private `0004_std_lib_http_client` repository. We will give it this permission by creating a new, limited-scope **Project Access Token** in GitLab.
+
+This token is the value we will store as `GITLAB_CHECKOUT_TOKEN` in our `cicd.env` file. It's crucial to do this *before* you deploy Jenkins, so that when the controller starts, our JCasC file can read this token and create the permanent `gitlab-checkout-credentials` credential.
+
+If you haven't created this token yet, follow these steps:
+
+1.  **Navigate to Your Project:** Open your GitLab instance and go to the `0004_std_lib_http_client` project.
+2.  **Go to Access Tokens:** In the project's left-hand sidebar, navigate to **Settings \> Access Tokens**.
+3.  **Add New Token:** Click the **"Add new token"** button.
+4.  **Fill out the form:**
+    * **Name:** `jenkins-checkout-token`
+    * **Role:** Select `Developer`. This provides just enough permission to clone the repository.
+    * **Scopes:** Check the box for **`read_repository`**. This is the *only* scope this token needs, following the Principle of Least Privilege.
+5.  **Create and Copy:** Click the **"Create project access token"** button. GitLab will display the token one time. Copy this token.
+6.  **Update Your `cicd.env`:** Open your master `cicd.env` file (in `~/cicd_stack/`) and add this token:
+    ```
+    GITLAB_CHECKOUT_TOKEN="glpat-..."
+    ```
+7.  **Update `jenkins.env`:** Open your `jenkins.env` file (in the Jenkins article directory) and add the same line:
+    ```
+    GITLAB_CHECKOUT_TOKEN="glpat-..."
+    ```
+
+Now, when you run your `01-setup-jenkins.sh` and `03-deploy-controller.sh` scripts, our JCasC file will automatically read this token and create the permanent `gitlab-checkout-credentials` in Jenkins. If you add this credential manually in the UI, **it will be deleted the next time your controller restarts.**
+
+## 8.2. Action 2: Jenkins UI (Create the Job)
+
+With our `Jenkinsfile` pushed to the repository, our "Foreman" (Jenkins) is ready to be given its assignment. We need to create a job that tells Jenkins to "watch" this specific GitLab project.
+
+We will use the **"Multibranch Pipeline"** job type. This is a powerful feature provided by our `gitlab-branch-source` plugin. Instead of creating a separate, static job for our `main` branch, we will create one "project" job that *automatically* discovers all branches, merge requests, and tags that contain a `Jenkinsfile` and creates jobs for them.
+
+Here are the steps to set this up:
+
+1.  **Log in to Jenkins** at `https://jenkins.cicd.local:10400` as your `admin` user.
+2.  From the dashboard, you can create a folder for organization (e.g., "Articles") or create the job directly. Click **"New Item"** in the left sidebar.
+3.  **Enter an item name:** `0004_std_lib_http_client`
+4.  Select **"Multibranch Pipeline"** from the list of job types and click **"OK"**.
+5.  You'll be taken to the configuration page. Scroll down to the **"Branch Sources"** section.
+6.  Click **"Add source"** and select **"GitLab project"**. This option is only here because we installed the `gitlab-branch-source` plugin.
+7.  Fill out the source configuration:
+    * **Server:** Select **"Local GitLab"**. This is the server connection we defined in our `jenkins.yaml` file.
+    * **Owner:** Select your GitLab group, **"Articles"**. Jenkins will use the `gitlab-api-token` (defined in JCasC) to scan this group for projects.
+    * **Project:** A dropdown will appear. Select **`0004_std_lib_http_client`**.
+    * **Checkout Credentials:** This is the solution to our "authentication failed" problem. In the dropdown, select our JCasC-defined credential: **`gitlab-checkout-bot / ******`**. This tells Jenkins to use our limited-scope Project Access Token for all `git clone` operations.
+
+8.  Click **"Save"**.
+
+As soon as you save, Jenkins will automatically perform an initial "Branch Indexing" scan. You can watch the log for this scan in the "Scan Multibranch Pipeline Log" in the sidebar. It will connect to GitLab (proving our controller's JVM trust), find your `main` branch, see the `Jenkinsfile`, and create a new job for it.
+
+---
+## 8.3. Action 3: GitLab UI (Set the Webhook)
+
+At this point, our job exists, but it doesn't know *when* we push new code. We could tell Jenkins to "Periodically scan," but this is inefficient. We want an instant, event-driven trigger.
+
+The solution is a **webhook**. We need to tell GitLab to send a "ping" to Jenkins every time we create a Merge Request.
+
+Normally, this is a manual step, but our plugin stack has a final surprise for us:
+
+1.  In your browser, go to your GitLab project: `https://gitlab.cicd.local:10300/Articles/0004_std_lib_http_client`.
+2.  In the left sidebar, go to **Settings > Webhooks**.
+
+You will see that a webhook pointing to our Jenkins instance **already exists**.
+
+This is the final payoff of our JCasC setup. When we configured the "Local GitLab" server in our `jenkins.yaml` and set `manageWebHooks: true`, we gave Jenkins (using its `gitlab-api-token`) permission to *automatically* create this webhook for us when we created the Multibranch job.
+
+**All we have to do is test it and tweak it:**
+
+1.  Click the **"Edit"** button for the auto-generated webhook.
+2.  **Tweak Triggers:** By default, it's likely set for "Push events." We want to follow our professional workflow. **Uncheck "Push events"** and ensure **"Merge request events"** is **checked**.
+3.  **Test the Connection:** Scroll down and click the **"Test"** button. Select **"Merge request events"** from the dropdown and click **"Test webhook"**.
+
+At the top of the page, you will see a green **`Hook executed successfully: HTTP 200`** message.
+
+This single message proves our entire security architecture is working end-to-end. It confirms that GitLab (whose JVM trusts our CA) successfully sent a secure HTTPS request to our Jenkins controller (which is serving traffic using its `.p12` keystore). The "Factory" and the "Library" are now fully and securely connected.
+
+### A Note on Advanced Triggers: The V2 Pipeline
+
+For our V1 pipeline, we've configured the webhook to trigger *only* on "Merge request events." This is a robust and common workflow that ensures we only run our full, expensive build and test suite when we're preparing to merge code.
+
+However, this is just the beginning. A more sophisticated, real-world pipeline would use **conditional logic** to run *different* sets of tasks based on the *type* of trigger.
+
+It is entirely possible (and standard practice) to enable both **"Push events"** and **"Merge request events."** We would then make our `Jenkinsfile` "smarter" by using its `when` directive to inspect the build's context.
+
+For example, in a V2 pipeline, we could configure:
+1.  **On a simple `git push` to a feature branch:** The `Jenkinsfile` would detect `env.BRANCH_NAME != 'main'` and `when { NOT { changeRequest() } }`. It would then *only* run fast jobs like linting and unit tests, giving the developer feedback in seconds.
+2.  **On a `push` to a Merge Request:** The `Jenkinsfile` would detect `when { changeRequest() }`. This would trigger our *full* validation pipeline: build, all tests (C++, Rust, Python), and coverage. This is our "quality gate."
+3.  **On a merge to the `main` branch (or a Git tag):** The `Jenkinsfile` would detect `env.BRANCH_NAME == 'main'`. This would run the full pipeline *plus* our new "Publish" stage (which we'll build in the next article) to save the compiled artifacts to Artifactory.
+
+We have started with a simple, effective "build everything on MR" strategy. We will build on this foundation later to create these more complex, conditional workflows.
+
+# Chapter 9: The Payoff - The First Automated Build
+
+Our infrastructure is 100% complete. Our `Jenkinsfile` is in the repository, our Jenkins job is configured to use our JCasC-defined credentials, and the GitLab webhook is automatically set up and tested.
+
+All that's left is to see it in action.
+
+---
+## 9.1. The "Scan"
+
+When you first created the "Multibranch Pipeline" job in the last chapter, Jenkins automatically performed an initial "Branch Indexing" scan. In the "Scan Multibranch Pipeline Log" (or by clicking "Scan Repository Now"), you would have seen Jenkins:
+
+1.  Connect to `https://gitlab.cicd.local` (proving the controller's JVM trust).
+2.  Use the `gitlab-api-token` to scan the `Articles/0004_std_lib_http_client` project.
+3.  Discover the `main` branch.
+4.  Find the `Jenkinsfile` in that branch.
+5.  Automatically create a new pipeline job named "main" and queue it for a build.
+
+This first build is the complete validation of our setup.
+
+---
+## 9.2. The "Build": Deconstructing the Success Log
+
+When you open the log for that first successful build, you are seeing the payoff for every single piece of our architecture. Let's narrate the log:
+
+1.  **`Provisioning 'general-purpose-agent...'`**
+    This first line is a triumph. It proves our "Foreman" (Controller) has successfully used the **Docker Plugin** (configured by JCasC) to begin "hiring" our worker.
+
+2.  **No "Pulling image..." Step**
+    You'll notice the log does *not* show a "Pulling image..." step. It immediately moves to creating the container. This proves our **`pullStrategy: 'PULL_NEVER'`** setting in `jenkins.yaml` is working, forcing the controller to use our local image.
+
+3.  **`Started container ID ...` & `Accepted JNLP4-connect connection...`**
+    This is the proof that our agent is working. The container started *without* the `exec: "-url": executable file not found` error. This confirms our **`ENTRYPOINT ["java", "-jar", ...]`** instruction in `Dockerfile.agent` is correct. The agent is up and connected.
+
+4.  **`using credential std-lib-http-client` & `git clone ...`**
+    The `git clone` succeeds. This proves two things:
+    * Our JCasC-defined **`gitlab-checkout-credentials`** are working.
+    * Our agent's **OS-level trust** (`update-ca-certificates`) is working, allowing `git` to trust `https://gitlab.cicd.local`.
+
+5.  **`Found Rust: /home/jenkins/.rustup/toolchains...`**
+    This confirms our `Dockerfile.agent` build process was correct. `cmake` is running as the `jenkins` user and is finding the Rust toolchain in `/home/jenkins/.cargo/bin` because we installed it under the correct user and added it to the `PATH`.
+
+6.  **`[100%] Built target...` & `100% tests passed...`**
+    The `setup.sh` and `run-coverage.sh` scripts complete. Our polyglot build—C++, Rust, and Python—has been successfully built and tested by our custom, ephemeral agent.
+
+7.  **`Finished: SUCCESS`**
+    The pipeline is complete. The agent container is automatically destroyed, along with all its build files.
+
+---
+## 9.3. The "Trigger": The Final Verification
+
+The manual scan proves the build works. This final test proves the *automation* works. We will now simulate a developer's workflow and watch the entire loop trigger automatically.
+
+1.  First, we'll go to the GitLab Webhooks page and show that the `gitlab-branch-source` plugin **automatically created the webhook for us**. We'll use the "Test" button to prove the `HTTP 200` connection.
+
+2.  Then, we'll guide the user to make a *real* change: `git checkout -b feature/test-trigger`, add a comment, `git push`, and **open a new Merge Request in GitLab**.
+
+3.  We'll watch the Jenkins UI as the `MR-1` build appears *instantly*, proving the webhook is functioning perfectly.
+
+This confirms our "Factory" and "Library" are perfectly connected.
+
+# Chapter 10: Conclusion
+
+## 10.1. What We've Built
+
+We have successfully built a complete, automated, and scalable CI (Continuous Integration) system. Our "Factory Foreman" (Jenkins) is fully operational and perfectly integrated with our "Central Library" (GitLab).
+
+Let's summarize what our new system accomplishes:
+* **Fully Automated Builds:** When a developer opens a Merge Request, a build is triggered *instantly* and automatically, with no human intervention.
+* **Secure & Trusted:** The entire connection is secured with our internal CA. GitLab sends a secure webhook to Jenkins, and Jenkins clones from GitLab over a trusted HTTPS connection.
+* **Scalable & Isolated Compute:** We are using a modern "Controller/Agent" architecture. The controller only orchestrates, and the *real* work is done by our `general-purpose-agent` containers. This means we can run multiple builds in parallel, each in its own clean, isolated environment.
+* **Consistent, Polyglot Environment:** Our custom agent image, built with our "dual-trust" fix and the correct user-context, is proven to work. It can build and test our complex C++, Rust, and Python project in a single, unified pipeline.
+
+---
+## 10.2. The New Problem: The "Ephemeral Artifact"
+
+Our pipeline log `Finished: SUCCESS` is a huge victory, but it also highlights our next major challenge. Our `setup.sh` script successfully compiled our C++ library (`libhttpc.so`), our Rust binaries, and our Python wheel (`.whl`), and `run-coverage.sh` proved they work.
+
+But what happened to them?
+
+They were created inside the `general-purpose-agent` container. The moment the build finished, that container was **immediately and permanently destroyed**, taking all those valuable, compiled "finished goods" with it.
+
+Our factory is running at 100% capacity, but we're just throwing every finished product into the incinerator. We have a "build," but we have no *artifacts*.
+
+---
+## 10.3. Next Steps: Building the "Secure Warehouse"
+
+Our "factory" is missing its "loading dock" and "warehouse."
+
+We need a central, persistent, and secure location to *store* our finished products. We need a system that can:
+1.  Receive the compiled `libhttpc.so`, the `httprust_client` binary, and the `httppy-0.1.0-py3-none-any.whl` file from our build agent.
+2.  Store them permanently and give them a version number.
+3.  Allow other developers or servers to download and use these "blessed" artifacts without having to rebuild the entire project themselves.
+
+This is the exact role of an **Artifact Repository Manager**. In the next article, we will build our "Secure Warehouse": **JFrog Artifactory**. We will then add a final "Publish" stage to our `Jenkinsfile` to solve this "ephemeral artifact" challenge once and for all.
