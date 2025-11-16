@@ -175,16 +175,86 @@ Therefore, our `Dockerfile.agent` must solve *both* problems simultaneously. We 
 
 By baking in this "dual trust," our `general-purpose-agent` will be born ready to communicate securely with all other services in our stack, regardless of the tool being used.
 
+
 # Chapter 4: Action Plan (Part 1) – The "Blueprints" (Dockerfiles & Plugins)
 
 With our architecture defined and our key integration challenges solved, we can now start building our two Docker images. We'll start by defining the "blueprints" for our controller and agent.
 
 The first step is to create the "shopping list" of plugins our controller will need. This file, `plugins.txt`, will be fed to the Jenkins plugin installer during our image build, ensuring our controller is born with all the "office furniture" it needs to do its job.
 
----
+-----
+
 ## 4.1. The "Plugin List" (`plugins.txt`)
 
 This file is a simple list of plugin IDs and their versions (we'll use `latest` for simplicity). Each one adds a critical piece of functionality that enables our specific architecture.
+
+Here is the complete `plugins.txt` file.
+
+```text
+#
+# -----------------------------------------------------------
+#                      plugins.txt
+#
+# This file lists all plugins to be installed by the
+# 'jenkins-plugin-cli' during our image build.
+#
+# Each plugin is a piece of "office furniture" for our
+# "Foreman," giving it new capabilities.
+# -----------------------------------------------------------
+
+# --- Dependencies and standard plugins ---
+pipeline-model-definition:latest
+cloudbees-folder:latest
+antisamy-markup-formatter:latest
+build-timeout:latest
+credentials-binding:latest
+timestamper:latest
+ws-cleanup:latest
+ant:latest
+gradle:latest
+workflow-aggregator:latest
+github-branch-source:latest
+pipeline-github-lib:latest
+pipeline-graph-analysis:latest
+git:latest
+ssh-slaves:latest
+ldap:latest
+email-ext:latest
+mailer:latest
+dark-theme:latest
+
+# --- Core Setup & Configuration ---
+
+# The "Blueprint Reader": Allows us to configure Jenkins using
+# our 'jenkins.yaml' file. The core of JCasC.
+configuration-as-code:latest
+
+# The "Security Guard": Allows us to create the granular
+# "who-can-do-what" permissions matrix.
+matrix-auth:latest
+
+# --- CI/CD Integration Plugins ---
+
+# The "Red Phone": The bridge to GitLab. This plugin
+# allows Jenkins to receive webhooks from GitLab and
+# provides the "Multibranch Pipeline" job type.
+gitlab-branch-source:latest
+
+# The "Hiring Department": This is the Docker Cloud plugin.
+# It's what allows our controller to "spawn" our
+# 'general-purpose-agent' containers.
+docker-plugin:latest
+
+# The "Secure Warehouse" Connector: Provides the native
+# 'rtUpload' steps to publish our artifacts to Artifactory.
+artifactory:latest
+
+# The "Quality Inspector" Connector: Provides the
+# 'withSonarQubeEnv' and 'waitForQualityGate' steps.
+sonar:latest
+```
+
+### Deconstructing `plugins.txt`
 
 Here are the key plugins we're installing and what they do:
 
@@ -194,26 +264,117 @@ Here are the key plugins we're installing and what they do:
     1.  The **"Multibranch Pipeline"** job type, which can scan a GitLab project and build all its branches.
     2.  The webhook endpoint (`/gitlab-webhook/trigger`) that allows GitLab to notify Jenkins of new commits and merge requests instantly.
 * **`docker-plugin`:** This is our "hiring department." It's the plugin that allows the controller to connect to the Docker socket, interpret our "cloud" configuration from `jenkins.yaml`, and physically spawn our `general-purpose-agent` containers.
-* **`pipeline-model-definition`:** This is a crucial dependency. We discovered during our earlier research that the `docker-plugin` will not load correctly without it. It provides the core APIs for defining declarative pipelines, which our agent-based model relies on.
+* **`pipeline-model-definition`:** This is a crucial dependency we discovered during our research. The `docker-plugin` will not load correctly without it, as it provides the core APIs for defining the declarative pipelines that our agent-based model relies on.
 
 ## 4.2. The "Foreman's Office" (`Dockerfile.controller`)
 
 With our plugin list defined, we can now write the blueprint for our "Foreman" or `jenkins-controller`. This `Dockerfile` is a surgical script designed to solve our specific architectural challenges *at build time*, resulting in a clean, secure, and ready-to-run image.
 
-We'll start by using the official `jenkins/jenkins:lts-jdk21` image as our base. This provides a trusted, stable foundation with a recent Java version.
+Here is the complete `Dockerfile.controller`:
 
-From there, the first thing we do is define the `HOST_DOCKER_GID` build argument. This allows us to pass in the host's Docker group ID during the build process. We then immediately switch to `USER root` because we need to perform two critical system-level installations.
+```dockerfile
+#
+# -----------------------------------------------------------
+#               Dockerfile.controller
+#
+#  This blueprint builds our "Foreman" (Jenkins Controller).
+#
+#  1. DooD: Installs Docker CLI & fixes GID permissions.
+#  2. CA Trust: Bakes in our Local CA to the JVM trust store.
+#  3. Plugins: Installs all plugins from 'plugins.txt'.
+#
+# -----------------------------------------------------------
 
-The first installation is for Docker-out-of-Docker (DooD). This is a single, multi-step `RUN` command that:
-1.  Adds the official Docker APT repository.
-2.  Installs the `docker-ce-cli` package.
-3.  **Fixes the GID mismatch.** This is the key. It inspects the `HOST_DOCKER_GID` we passed in. It then creates a `docker` group *inside the container* with that exact numerical GID and adds the `jenkins` user to it. This is a permanent, clean solution. By solving the permission issue at the image level, we don't have to use any special `--group-add` flags in our `docker run` command, making our deployment script much simpler.
+# 1. Start from the official Jenkins Long-Term Support image
+FROM jenkins/jenkins:lts-jdk21
+LABEL authors="warren_jitsing"
 
-The second installation solves our Java trust challenge. This `RUN` command `COPY`-ies our `ca.pem` (from Article 2) into the container and immediately uses the Java `keytool` utility to import it into the master `cacerts` trust store. This "bakes" our internal CA's trust directly into the controller's JVM, permanently eliminating any `SSLHandshakeException` errors when Jenkins tries to contact our GitLab server.
+# 2. Accept the host's 'docker' GID as a build-time argument
+ARG HOST_DOCKER_GID
 
-With these system-level fixes applied, we switch back to the low-privilege `USER jenkins`.
+# 3. Switch to 'root' to install software and fix permissions
+USER root
 
-Finally, as the `jenkins` user, we `COPY` our `plugins.txt` file and run the `jenkins-plugin-cli` script. This will read our list and install every plugin, ensuring our controller boots up for the first time with all the tools (JCasC, Docker, GitLab) it needs to execute our plan.
+# 4. Copy our Local CA cert from the build context
+# (Our '01-setup-jenkins.sh' will place this file here)
+COPY ca.pem /tmp/ca.pem
+
+# 5. Fix CA Trust (for both OS/git and JVM)
+# This is "baked in" for simplicity and robustness
+RUN cp /tmp/ca.pem /usr/local/share/ca-certificates/cicd-stack-ca.crt \
+    && update-ca-certificates \
+    && keytool -importcert \
+        -keystore /opt/java/openjdk/lib/security/cacerts \
+        -storepass changeit \
+        -file /tmp/ca.pem \
+        -alias "CICD-Root-CA" \
+        -noprompt \
+    && rm /tmp/ca.pem
+
+# 6. Install Docker CLI & Fix GID Mismatch
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        docker-ce-cli \
+    && groupadd --gid $HOST_DOCKER_GID docker \
+    && usermod -aG docker jenkins \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 7. Switch back to the unprivileged 'jenkins' user
+USER jenkins
+
+# 8. Copy our plugin list into the official ref directory
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+
+# 9. Run the official plugin installer script
+RUN jenkins-plugin-cli -f /usr/share/jenkins/ref/plugins.txt
+```
+
+-----
+
+### Deconstructing `Dockerfile.controller`
+
+Let's walk through this blueprint layer by layer to understand how it solves our specific challenges.
+
+* **`FROM jenkins/jenkins:lts-jdk21`**
+  We start with the official Long-Term Support (LTS) image for the Jenkins controller. This provides a trusted, stable foundation with a recent Java version.
+
+* **`ARG HOST_DOCKER_GID`**
+  This instruction defines a build-time argument. It's how we'll pass the host's Docker group ID into the image when we run our `02-build-images.sh` script.
+
+* **`USER root`**
+  We switch to the `root` user because we need to perform two critical, system-level installations that the standard `jenkins` user doesn't have permission to do.
+
+* **Step 5: Fix CA Trust**
+  This `RUN` command solves our **"JVM Trust" puzzle**. It `COPY`-ies the `ca.pem` we staged in our setup script and:
+
+    1.  Runs `update-ca-certificates` to add our CA to the **Operating System's** trust store.
+    2.  Runs the Java `keytool` command to import the *same certificate* into the **JVM's** master `cacerts` file.
+        By "baking" this trust into the image, we permanently solve any `SSLHandshakeException` errors. Our controller is now born with a JVM that implicitly trusts our internal GitLab server.
+
+* **Step 6: Install Docker CLI & Fix GID Mismatch**
+  This `RUN` command solves our **"DooD Permission" puzzle**. It's a single, multi-step command that:
+
+    1.  Adds the official Docker APT repository.
+    2.  Installs the `docker-ce-cli` package, giving our controller the `docker` command.
+    3.  **Fixes the GID.** This is the key. It executes `groupadd --gid $HOST_DOCKER_GID docker` to create a new `docker` group *inside the container* that has the *exact same numerical GID* as the one on our host.
+    4.  Finally, it adds the `jenkins` user to this new, correctly-ID'd group.
+        This is a permanent, clean solution. By solving the permission issue at the image level, we don't have to use any special `--group-add` flags in our `docker run` command.
+
+* **`USER jenkins`**
+  With all our system-level modifications complete, we switch back to the low-privilege `jenkins` user for the rest of the build.
+
+* **Steps 8 & 9: Install Plugins**
+  This is the final step. We `COPY` our `plugins.txt` "shopping list" into the official location Jenkins uses for pre-installing plugins. We then `RUN` the `jenkins-plugin-cli` script, which reads this list and installs every plugin. This ensures our controller boots up for the first time with all the tools (JCasC, Docker, GitLab) it needs.
 
 ## 4.3. The "Factory Worker" (`Dockerfile.agent`)
 
@@ -221,28 +382,148 @@ This is the blueprint for our `general-purpose-agent`, our "polyglot" factory wo
 
 We start `FROM jenkins/agent:latest-jdk21`. This is a crucial starting point. Unlike the `jenkins/jenkins` controller image, this one is a bare-bones Debian base that includes the Java JDK and the `agent.jar` file, which is responsible for communicating with the controller.
 
-As we did with the controller, we immediately switch to `USER root` to begin our system-level installations.
+Here is the complete `Dockerfile.agent`:
 
-First, we install all the OS dependencies. This `RUN apt-get install...` command is a "harvested" and expanded version of the one from our `dev-container`. It includes everything our hero project needs: `cmake`, `build-essential`, `libboost-all-dev`, `libcurl4-openssl-dev`, and all the Python build dependencies.
+```dockerfile
+#
+# -----------------------------------------------------------
+#                    Dockerfile.agent
+#
+#  This blueprint builds our "General Purpose Worker".
+#  It starts from the base Jenkins agent image and "harvests"
+#  all the complex toolchains from our dev-container to
+#  create a "polyglot" builder.
+#
+#  It is a "cattle" image: stateless, disposable, but
+#  loaded with all the tools our "hero project" needs.
+# -----------------------------------------------------------
 
-Next, we run the same custom build commands from our `dev-container` to compile and install our specific versions of **GCC** and the **Python** runtimes. This ensures our build agent has the *exact same toolchain* as our development environment, which is the key to solving the "it works on my machine" problem.
+# 1. Start from the official Jenkins agent image (Debian 12 + JDK 21)
+FROM jenkins/agent:latest-jdk21
+LABEL authors="warren_jitsing"
 
-We also add a new step to install the `sonar-scanner` CLI by downloading it from SonarSource, unzipping it, and adding it to the system's `PATH`.
+# 2. Get ARGs from our dev-container for custom builds
+ARG py312="3.12.12"
+ARG py313="3.13.9"
+ARG py314="3.14.0"
+ARG gcc15="15.2.0"
 
-With the toolchain installed, we tackle the "dual trust" challenge. We add a `RUN` command that `COPY`-ies our `ca.pem` and then:
-1.  Runs `update-ca-certificates`. This makes the OS (and tools like `git`) trust our internal CA.
-2.  Runs `keytool -importcert...`. This makes the agent's *own JVM* (and tools like `sonar-scanner`) trust our internal CA.
+# 3. Switch to 'root' to install everything
+USER root
 
-This is where we hit a critical discovery from our debugging. The next `USER` command is vital. We switch to `USER jenkins` *before* installing our user-space tools. If we hadn't, `rustup` would have installed everything in `/root/.cargo`, which the `jenkins` user can't access.
+# 4. Copy our Local CA cert from the build context
+# (Our '01-setup-jenkins.sh' will place this file here)
+COPY ca.pem /tmp/ca.pem
 
-So, as the `jenkins` user, we `RUN` the `rustup` and `juliaup` installers. This correctly places their binaries in `/home/jenkins/.cargo/bin` and `/home/jenkins/.juliaup/bin`. We follow this with an `ENV PATH` instruction to permanently add these new directories to the `jenkins` user's `PATH`.
+# 5. Install all OS dependencies (harvested from dev-container + hero project)
+# This includes base tools, "hero project" deps, and Python build deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates cmake curl flex \
+    git git-lfs gnupg2 sudo wget unzip \
+    llvm lcov hyperfine libcurl4-openssl-dev libboost-all-dev \
+    libbz2-dev libffi-dev libgdbm-compat-dev libgdbm-dev liblzma-dev \
+    libncurses5-dev libreadline-dev libsqlite3-dev libssl-dev \
+    python3-dev python3-pip python3-tk uuid-dev zlib1g-dev \
+    m4 patch pkg-config procps \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-Finally, we address the most significant challenge we found during testing. Our `docker image inspect` revealed that the base `jenkins/agent` image has **no `ENTRYPOINT`**. This is why our builds were failing with the `exec: "-url": executable file not found` error. The Docker plugin was passing the JNLP connection arguments as a `CMD`, but there was no entrypoint program to receive them.
+# 6. Build and install custom GCC
+RUN mkdir -p /tmp/deps/gcc \
+    && cd /tmp/deps/gcc \
+    && curl -fsSL "https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${gcc15}.tar.gz" | tar -xz --strip-components=1 \
+    && ./contrib/download_prerequisites \
+    && mkdir build && cd build \
+    && ../configure --disable-multilib --enable-languages=c,c++ \
+    && make -j $(nproc) \
+    && make install \
+    && cd / \
+    && rm -rf /tmp/deps
 
-We solve this by adding the final, critical instruction to our Dockerfile:
-`ENTRYPOINT ["java", "-jar", "/usr/share/jenkins/agent.jar"]`
+# 7. Add our new custom GCC to the system-wide PATH
+RUN echo 'export PATH="/usr/local/bin:${PATH}"' > /etc/profile.d/gcc.sh \
+    && echo 'export LD_LIBRARY_PATH="/usr/local/lib64:${LD_LIBRARY_PATH}"' >> /etc/profile.d/gcc.sh
 
-This "promotes" our image from a simple "bag of tools" to a fully functional, executable agent. This `ENTRYPOINT` is the Java program that will run, consume the `-url`, `-secret`, and `-name` arguments, and successfully connect back to our Jenkins controller.
+# 8. Build and install custom Python versions
+RUN for version in $py312 $py313 $py314; do \
+        echo "--- Building Python version ${version} ---"; \
+        mkdir -p /tmp/deps/python; \
+        cd /tmp/deps/python; \
+        curl -fsSL "https://github.com/python/cpython/archive/refs/tags/v${version}.tar.gz" | tar -xz --strip-components=1; \
+        CONFIGURE_FLAGS="--enable-optimizations --enable-loadable-sqlite-extensions --with-lto=full"; \
+        if [ "$version" = "$py313" ] || [ "$version" = "$py314" ]; then \
+            echo "--- Adding --disable-gil flag for nogil build ---"; \
+            CONFIGURE_FLAGS="$CONFIGURE_FLAGS --disable-gil"; \
+        fi; \
+        ./configure $CONFIGURE_FLAGS; \
+        make -j $(nproc); \
+        make altinstall; \
+        cd / ; \
+    done \
+    && rm -rf /tmp/deps
+
+# 9. Install SonarScanner CLI (as root)
+RUN wget -O /tmp/sonar.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189-linux-x64.zip" \
+    && unzip /tmp/sonar.zip -d /opt \
+    && mv /opt/sonar-scanner-* /opt/sonar-scanner \
+    && ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/bin/sonar-scanner \
+    && rm /tmp/sonar.zip
+
+# 10. Fix CA Trust (for both OS/git and JVM) (as root)
+RUN cp /tmp/ca.pem /usr/local/share/ca-certificates/cicd-stack-ca.crt \
+    && update-ca-certificates \
+    && keytool -importcert \
+        -keystore /opt/java/openjdk/lib/security/cacerts \
+        -storepass changeit \
+        -file /tmp/ca.pem \
+        -alias "CICD-Root-CA" \
+        -noprompt \
+    && rm /tmp/ca.pem
+
+# 11. Switch to the default agent user
+USER jenkins
+
+# 12. Install user-specific toolchains (Rust and Julia)
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y \
+    && curl -fsSL https://install.julialang.org | sh -s -- -y
+
+# 13. Install cargo-llvm-cov
+# We must source the env file in the *same* command
+RUN . "$HOME/.cargo/env" && cargo install cargo-llvm-cov
+
+# 14. Add the new toolchains to the container's PATH
+# This ENV instruction makes them available to all subsequent
+# Jenkins 'sh' steps.
+ENV PATH="/home/jenkins/.cargo/bin:/home/jenkins/.juliaup/bin:${PATH}"
+
+# 15. Set the Entrypoint (must be last)
+ENTRYPOINT ["java", "-jar", "/usr/share/jenkins/agent.jar"]
+```
+
+-----
+
+### Deconstructing `Dockerfile.agent`
+
+This `Dockerfile` is more complex than the controller's because it's responsible for building our actual "polyglot" toolchain.
+
+* **Steps 1-8: Harvesting the Toolchain**
+  Just like our controller, we switch to `root` to install system software. The `apt-get` command is a "harvested" list from our `dev-container`, containing all the C++, Boost, and Python dependencies our "hero project" needs. We then run the *exact same* build-from-source commands for **GCC** and **Python**. This is the key to solving the "it works on my machine" problem: our build agent's toolchain is now identical to our development environment's.
+
+* **Step 9: Pre-installing Future Tools**
+  We also take this opportunity to install the `sonar-scanner` CLI. We aren't using it yet, but pre-installing it here means our agent will be ready for our SonarQube (Quality Assurance) article without needing another rebuild.
+
+* **Step 10: The "Dual Trust" Fix**
+  This `RUN` command is critical. It solves the trust problem for *both* toolchains on the agent:
+
+    1.  `update-ca-certificates`: This makes the **Operating System** (and thus tools like `git` and `curl`) trust our internal CA.
+    2.  `keytool -importcert...`: This makes the **JVM** (and thus Java-based tools like `sonar-scanner`) trust our internal CA.
+        Without this "dual fix," either our `git clone` or our future quality scan would fail.
+
+* **Steps 11-14: The User-Context Switch**
+  This is the solution to our `cargo: command not found` debugging session. We switch to the `USER jenkins` *before* installing user-space tools. The `rustup` and `juliaup` installers now correctly place their binaries in `/home/jenkins/.cargo/bin`. We then use the `ENV` instruction to permanently add this new directory to the `jenkins` user's `PATH`, making `cargo` and `rustc` available to all pipeline steps.
+
+* **Step 15: The `ENTRYPOINT` Fix**
+  This is the final, and most important, instruction. Our investigation with `docker image inspect` revealed that the `jenkins/agent` base image has no `ENTRYPOINT`. This was the cause of our `exec: "-url": executable file not found` error, as the Docker plugin was passing its connection arguments as a command. This line "promotes" our image from a simple "bag of tools" to a functional, executable agent. This Java command is the program that will run, consume the connection arguments, and successfully link our worker to the controller.
 
 # Chapter 5: Action Plan (Part 2) – The "Factory Layout" (JCasC)
 
