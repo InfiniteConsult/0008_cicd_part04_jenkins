@@ -75,6 +75,15 @@ RUN for version in $py312 $py313 $py314; do \
     done \
     && rm -rf /tmp/deps
 
+RUN echo "export CC=/usr/local/bin/gcc" >> /root/.bashrc \
+    && echo "export CXX=/usr/local/bin/g++" >> /root/.bashrc \
+    && echo "export CC=/usr/local/bin/gcc" >> /home/jenkins/.bashrc \
+    && echo "export CXX=/usr/local/bin/g++" >> /home/jenkins/.bashrc
+
+ENV CC="/usr/local/bin/gcc"
+ENV CXX="/usr/local/bin/g++"
+ENV LD_LIBRARY_PATH="/usr/local/lib64:${LD_LIBRARY_PATH}"
+
 # 9. Install SonarScanner CLI (as root)
 RUN wget -O /tmp/sonar.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.3.0.5189-linux-x64.zip" \
     && unzip /tmp/sonar.zip -d /opt \
