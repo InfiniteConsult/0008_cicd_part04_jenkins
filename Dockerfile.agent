@@ -111,7 +111,7 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y \
 
 # 13. Install cargo-llvm-cov
 # We must source the env file in the *same* command
-RUN . "$HOME/.cargo/env" && cargo install cargo-llvm-cov
+RUN . "$HOME/.cargo/env" && rustup component add llvm-tools-preview --toolchain stable-x86_64-unknown-linux-gnu && cargo install cargo-llvm-cov
 
 # 14. Add the new toolchains to the container's PATH
 # This ENV instruction makes them available to all subsequent
