@@ -59,3 +59,6 @@ artifactory:latest
 # The "Quality Inspector" Connector: Provides the
 # 'withSonarQubeEnv' and 'waitForQualityGate' steps.
 sonar:latest
+
+# The "Public Address System": Sends build notifications to Mattermost channels
+mattermost:latest
