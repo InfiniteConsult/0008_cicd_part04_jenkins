@@ -45,7 +45,7 @@ matrix-auth:latest
 # The "Red Phone": The bridge to GitLab. This plugin
 # allows Jenkins to receive webhooks from GitLab and
 # provides the "Multibranch Pipeline" job type.
-gitlab-branch-source:725.v1a_1e87b_49f3a_
+gitlab-branch-source:latest
 
 # The "Hiring Department": This is the Docker Cloud plugin.
 # It's what allows our controller to "spawn" our
