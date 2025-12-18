@@ -62,3 +62,6 @@ sonar:latest
 
 # The "Public Address System": Sends build notifications to Mattermost channels
 mattermost:latest
+
+# Application level node exporter for prometheus integrations
+prometheus:latest
