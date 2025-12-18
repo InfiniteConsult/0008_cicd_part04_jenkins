@@ -64,6 +64,7 @@ cat << EOF > "$SCOPED_ENV_FILE"
 JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
 GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
 GITLAB_CHECKOUT_TOKEN=${GITLAB_CHECKOUT_TOKEN}
+ARTICLES_GAT=${ARTICLES_GAT}
 
 # --- Keystore Password ---
 JENKINS_KEYSTORE_PASSWORD=${JENKINS_KEYSTORE_PASSWORD}
@@ -238,6 +239,11 @@ credentials:
               description: "GitLab Project Token for repo checkout"
               username: "gitlab-checkout-bot"
               password: "\${GITLAB_CHECKOUT_TOKEN}"
+          # NEW: Modern credential for Plugin > v736
+          - gitlabGroupAccessToken:
+              id: "articles-gat"
+              scope: GLOBAL
+              token: "\${ARTICLES_GAT}"
 
 # --- Plugin Configuration (The "Bridge" to GitLab) ---
 unclassified:

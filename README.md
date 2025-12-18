@@ -1,3 +1,28 @@
+---
+
+**UPDATE 2025-12-09: Critical Plugin Change (GitLab Branch Source)**
+
+The `gitlab-branch-source` plugin has recently undergone a major update (versions > 736), migrating to a newer GitLab API client. This introduces a breaking change regarding authentication.
+
+**The Issue:**
+Previously, we used a standard `usernamePassword` credential (where the password was the token) for git checkout. On newer plugin versions, this method fails with `HTTP 403 Forbidden` or `USER NOT FOUND` errors because the plugin now strictly enforces credential types.
+
+**The Solution:**
+Newer versions require specific **GitLab Group Access Token** or **GitLab Personal Access Token** credential types to perform checkouts. To ensure this tutorial works for all versions, we will configure **both** the legacy credential and the new **Group Access Token (GAT)** in our system.
+
+**Action Required:**
+We will introduce a new token variable. Please create a **Group Access Token** in GitLab (Scope: `api`, `read_repository`, Role: `Maintainer`) for your top-level `Articles` group and add it to your `cicd.env` file alongside your existing tokens:
+
+```bash
+# cicd.env
+# ... existing tokens ...
+ARTICLES_GAT="glpat-m2BG...[redacted]..."
+```
+
+---
+
+In the following sections, we will update our scripts to pass this new token to Jenkins. When configuring your job, you can then simply select the credential type that works for your specific installed version of the plugin.
+
 # Chapter 1: The Challenge: Our Code is Just Sitting on a Shelf
 
 In our last article, we built our "Central Library," a secure, self-hosted GitLab instance. This was a massive step forward. Our code—including our polyglot "hero project"—is now version-controlled, secure, and stored in a central, trusted location. But this success has also revealed our next, and most obvious, challenge: our code is just *sitting there*.
@@ -591,12 +616,18 @@ credentials:
               description: "GitLab Project Token for repo checkout"
               username: "gitlab-checkout-bot"
               password: "${GITLAB_CHECKOUT_TOKEN}"
+          # NEW: Modern credential for Plugin > v736
+          - gitlabGroupAccessToken:
+              id: "articles-gat"
+              scope: GLOBAL
+              token: "${ARTICLES_GAT}"
 ```
 
 Here, we are creating two critical credentials:
 
 1.  **`gitlab-api-token`**: This is a `string` (or secret text) credential. It holds our "all-powerful" GitLab PAT. The controller itself will use this token for API calls, like scanning repositories or reporting build status.
 2.  **`gitlab-checkout-credentials`**: This is a `usernamePassword` credential. It holds the *Project Access Token* we created for our `http-client` project. The `username` is just a descriptive label, and the `password` is the token itself (read from `${GITLAB_CHECKOUT_TOKEN}`). Our pipeline job will use this to `git clone` the private repository.
+3.  **`articles-gat`** **(New for 2025)**: Newer versions of the gitlab-branch-source plugin (v736+) require a strictly typed Group Access Token. We define this as a gitlabGroupAccessToken credential using the ${ARTICLES_GAT} variable. This ensures that if you are using a modern plugin version, you will have a valid credential available for checkout that avoids the 403 Forbidden error.
 
 ### The `unclassified:` Block: The "GitLab Bridge"
 
@@ -767,6 +798,7 @@ cat << EOF > "$SCOPED_ENV_FILE"
 JENKINS_ADMIN_PASSWORD=${JENKINS_ADMIN_PASSWORD}
 GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
 GITLAB_CHECKOUT_TOKEN=${GITLAB_CHECKOUT_TOKEN}
+ARTICLES_GAT=${ARTICLES_GAT}
 
 # --- Keystore Password ---
 JENKINS_KEYSTORE_PASSWORD=${JENKINS_KEYSTORE_PASSWORD}
@@ -939,6 +971,11 @@ credentials:
               description: "GitLab Project Token for repo checkout"
               username: "gitlab-checkout-bot"
               password: "\${GITLAB_CHECKOUT_TOKEN}"
+          # NEW: Modern credential for Plugin > v736
+          - gitlabGroupAccessToken:
+              id: "articles-gat"
+              scope: GLOBAL
+              token: "\${ARTICLES_GAT}"              
 
 # --- Plugin Configuration (The "Bridge" to GitLab) ---
 unclassified:
@@ -1442,6 +1479,24 @@ If you haven't created this token yet, follow these steps:
 
 Now, when you run your `01-setup-jenkins.sh` and `03-deploy-controller.sh` scripts, our JCasC file will automatically read this token and create the permanent `gitlab-checkout-credentials` in Jenkins. If you add this credential manually in the UI, **it will be deleted the next time your controller restarts.**
 
+**UPDATE 2025-12-09: Creating the Group Access Token**
+
+To satisfy the `articles-gat` requirement for newer plugins, you must also create a **Group Access Token**.
+
+1. **Navigate to the Group:** Go to your top-level **"Articles"** group in GitLab (not the specific project).
+2. **Access Tokens:** Go to **Settings > Access Tokens**.
+3. **Create Token:**
+   * **Name:** `jenkins-group-token`
+   * **Role:** `Maintainer` (recommended for full webhook management) or `Developer`.
+   * **Scopes:** Select `api` and `read_repository`.
+4. **Save:** Copy the token (`glpat-...`).
+5. **Update `cicd.env`:** Add this token to your `cicd.env` file as `ARTICLES_GAT`.
+
+```bash
+ARTICLES_GAT="glpat-..."
+
+```
+
 ## 8.2. Action 2: Jenkins UI (Create the Job)
 
 With our `Jenkinsfile` pushed to the repository, our "Foreman" (Jenkins) is ready to be given its assignment. We need to create a job that tells Jenkins to "watch" this specific GitLab project.
@@ -1465,6 +1520,14 @@ Here are the steps to set this up:
 8.  Click **"Save"**.
 
 As soon as you save, Jenkins will automatically perform an initial "Branch Indexing" scan. You can watch the log for this scan in the "Scan Multibranch Pipeline Log" in the sidebar. It will connect to GitLab (proving our controller's JVM trust), find your `main` branch, see the `Jenkinsfile`, and create a new job for it.
+
+**UPDATE 2025-12-09**
+
+**Step 7 (Checkout Credentials):**
+When selecting credentials, the dropdown behavior depends on your plugin version:
+
+* **Legacy Plugin:** Select `gitlab-checkout-bot` (Username/Password).
+* **Modern Plugin:** Select `articles-gat` (Group Access Token). If you see "403" errors or if the legacy credential is missing from the list, choose this option.
 
 ---
 ## 8.3. Action 3: GitLab UI (Set the Webhook)
