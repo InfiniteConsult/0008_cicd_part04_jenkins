@@ -1,5 +1,3 @@
----
-
 **UPDATE 2025-12-09: Critical Plugin Change (GitLab Branch Source)**
 
 The `gitlab-branch-source` plugin has recently undergone a major update (versions > 736), migrating to a newer GitLab API client. This introduces a breaking change regarding authentication.
